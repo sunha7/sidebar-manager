@@ -38,7 +38,17 @@ public class SidebarManagerRuntimeTest
     {
         onEdt(() ->
         {
-            sidebar = new JTabbedPane(JTabbedPane.RIGHT);
+            // The size override is only applied once RuneLite has laid out a
+            // visible sidebar. Simulate that state without opening a real frame.
+            sidebar = new JTabbedPane(JTabbedPane.RIGHT)
+            {
+                @Override
+                public boolean isShowing()
+                {
+                    return true;
+                }
+            };
+            sidebar.setSize(300, 500);
             originalContainerListeners = sidebar.getContainerListeners();
             bank = new JPanel();
             notes = new JPanel();
@@ -255,6 +265,8 @@ public class SidebarManagerRuntimeTest
         {
             assertEquals(-1, sidebar.getSelectedIndex());
             assertTrue(sidebar.isPreferredSizeSet());
+            assertFalse(sidebar.isMinimumSizeSet());
+            assertFalse(sidebar.isMaximumSizeSet());
             sidebar.setSelectedComponent(notes);
         });
         drainEdt();
@@ -264,6 +276,58 @@ public class SidebarManagerRuntimeTest
             assertFalse(sidebar.isMinimumSizeSet());
             assertFalse(sidebar.isMaximumSizeSet());
         });
+    }
+
+    @Test
+    public void collapsedSizingWaitsUntilSidebarIsShowing() throws Exception
+    {
+        JTabbedPane hiddenSidebar = new JTabbedPane(JTabbedPane.RIGHT)
+        {
+            @Override
+            public boolean isShowing()
+            {
+                return false;
+            }
+        };
+        hiddenSidebar.setSize(300, 500);
+        hiddenSidebar.insertTab(null, icon, new JPanel(), "Bank Value History", 0);
+
+        SidebarManagerConfig hiddenConfig = new SidebarManagerConfig()
+        {
+            @Override
+            public boolean scrollableSidebar()
+            {
+                return true;
+            }
+        };
+        SidebarManager hiddenManager = new SidebarManager(hiddenConfig, null)
+        {
+            @Override
+            JTabbedPane findSidebar()
+            {
+                return hiddenSidebar;
+            }
+
+            @Override
+            String getStoredValue(String key)
+            {
+                return null;
+            }
+
+            @Override
+            void setStoredValue(String key, String value)
+            {
+            }
+        };
+
+        onEdt(hiddenManager::start);
+        drainEdt();
+        onEdt(() ->
+        {
+            assertFalse(hiddenSidebar.isPreferredSizeSet());
+            hiddenManager.stop();
+        });
+        drainEdt();
     }
 
     @Test
@@ -304,6 +368,49 @@ public class SidebarManagerRuntimeTest
                 assertNull(sidebar.getTitleAt(index));
                 assertSame(icon, sidebar.getIconAt(index));
             }
+        });
+    }
+
+    @Test
+    public void programmaticOpenPanelFollowsNativeOrderNotVisualIndex() throws Exception
+    {
+        onEdt(() -> manager.moveItem(item("Bank Value History"), 2));
+        drainEdt();
+        onEdt(() ->
+        {
+            assertSame(notes, sidebar.getComponentAt(0));
+            // RuneLite asks for native rank 0 (Bank Value History) by selecting index 0
+            net.runelite.client.ui.ClientUI.openPanel(sidebar, 0);
+        });
+        drainEdt();
+        onEdt(() -> assertSame(bank, sidebar.getSelectedComponent()));
+    }
+
+    @Test
+    public void userTabSelectionIsNotRemapped() throws Exception
+    {
+        onEdt(() -> manager.moveItem(item("Bank Value History"), 2));
+        drainEdt();
+        onEdt(() -> sidebar.setSelectedIndex(0));
+        drainEdt();
+        onEdt(() -> assertSame(notes, sidebar.getSelectedComponent()));
+    }
+
+    @Test
+    public void programmaticOpenPanelUnhidesRequestedItem() throws Exception
+    {
+        onEdt(() -> manager.hideItem(item("Bank Value History")));
+        drainEdt();
+        onEdt(() ->
+        {
+            assertEquals(-1, sidebar.indexOfComponent(bank));
+            net.runelite.client.ui.ClientUI.openPanel(sidebar, 0);
+        });
+        drainEdt();
+        onEdt(() ->
+        {
+            assertSame(bank, sidebar.getSelectedComponent());
+            assertNull(settings.get("hiddenItems"));
         });
     }
 

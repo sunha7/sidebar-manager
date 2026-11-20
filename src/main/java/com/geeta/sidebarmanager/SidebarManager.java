@@ -7,6 +7,9 @@ import java.awt.Dimension;
 import java.awt.Frame;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
+import java.awt.event.ComponentListener;
 import java.awt.event.ContainerAdapter;
 import java.awt.event.ContainerEvent;
 import java.awt.event.ContainerListener;
@@ -46,11 +49,15 @@ public class SidebarManager
     private SidebarManagerPanel panel;
     private ChangeListener sidebarChangeListener;
     private ContainerListener sidebarContainerListener;
+    private ComponentListener sidebarVisibilityListener;
     private boolean changingTabs;
     private boolean navigationPending;
+    private boolean correctingSelection;
+    private boolean collapsedWidthApplied;
     private boolean running;
     private long lifecycleVersion;
     private long refreshVersion;
+    private long resizeVersion;
 
     @Inject
     public SidebarManager(
@@ -94,9 +101,7 @@ public class SidebarManager
                 panel.refresh();
             }
 
-            SwingUtilities.invokeLater(
-                    this::updateCollapsedWidth
-            );
+            scheduleCollapsedWidthUpdate();
         });
     }
 
@@ -122,6 +127,7 @@ public class SidebarManager
             sidebar.setPreferredSize(null);
             sidebar.setMinimumSize(null);
             sidebar.setMaximumSize(null);
+            collapsedWidthApplied = false;
 
             restoreRuneLiteSidebar();
 
@@ -140,7 +146,6 @@ public class SidebarManager
                 return;
             }
 
-            clearSidebarSizeConstraint();
             applySidebarSettings();
         });
     }
@@ -240,9 +245,7 @@ public class SidebarManager
         sidebar.revalidate();
         sidebar.repaint();
 
-        SwingUtilities.invokeLater(
-                this::updateCollapsedWidth
-        );
+        scheduleCollapsedWidthUpdate();
     }
 
     private void updateTab(int index)
@@ -429,7 +432,11 @@ public class SidebarManager
             return;
         }
 
-        sidebarChangeListener = event -> SwingUtilities.invokeLater(this::updateCollapsedWidth);
+        sidebarChangeListener = event ->
+        {
+            correctProgrammaticSelection();
+            scheduleCollapsedWidthUpdate();
+        };
         sidebar.addChangeListener(sidebarChangeListener);
 
         sidebarContainerListener = new ContainerAdapter()
@@ -488,6 +495,112 @@ public class SidebarManager
             }
         };
         sidebar.addContainerListener(sidebarContainerListener);
+
+        sidebarVisibilityListener = new ComponentAdapter()
+        {
+            @Override
+            public void componentShown(ComponentEvent event)
+            {
+                scheduleCollapsedWidthUpdate();
+            }
+
+            @Override
+            public void componentHidden(ComponentEvent event)
+            {
+                scheduleCollapsedWidthUpdate();
+            }
+
+            @Override
+            public void componentResized(ComponentEvent event)
+            {
+                // RuneLite may show the sidebar before it has a real height; the
+                // first resize is the earliest safe point to apply our width.
+                scheduleCollapsedWidthUpdate();
+            }
+        };
+        sidebar.addComponentListener(sidebarVisibilityListener);
+    }
+
+    /**
+     * RuneLite addresses panels by tab index: ClientUI.openPanel() selects
+     * sidebarEntries.headSet(navBtn).size(), i.e. the tab's priority-sorted
+     * position. Reordering or hiding tabs breaks that assumption, so an action
+     * such as right-click > Lookup opens whichever tab was moved into the slot
+     * the HiScore panel used to occupy. Remap those programmatic selections to
+     * the tab the caller actually asked for.
+     */
+    private void correctProgrammaticSelection()
+    {
+        if (sidebar == null || navigationPending || changingTabs || correctingSelection)
+        {
+            return;
+        }
+
+        if (!isProgrammaticOpenPanelSelection())
+        {
+            return;
+        }
+
+        int selectedIndex = sidebar.getSelectedIndex();
+        if (selectedIndex < 0)
+        {
+            return;
+        }
+
+        SidebarItem intended = findItemByOriginalIndex(selectedIndex);
+        if (intended == null || intended == findItem(sidebar.getComponentAt(selectedIndex)))
+        {
+            return;
+        }
+
+        int actualIndex = sidebar.indexOfComponent(intended.getComponent());
+        if (actualIndex == -1)
+        {
+            // The requested panel is hidden by this plugin; bring it back so the
+            // lookup (or any other openPanel call) can actually show its result.
+            showItem(intended);
+            actualIndex = sidebar.indexOfComponent(intended.getComponent());
+        }
+
+        // Inserting a previously hidden tab shifts the selected index, so compare
+        // components rather than the index captured before showItem().
+        if (actualIndex != -1 && sidebar.getSelectedComponent() != intended.getComponent())
+        {
+            correctingSelection = true;
+            try
+            {
+                sidebar.setSelectedIndex(actualIndex);
+            }
+            finally
+            {
+                correctingSelection = false;
+            }
+        }
+    }
+
+    boolean isProgrammaticOpenPanelSelection()
+    {
+        for (StackTraceElement element : new Throwable().getStackTrace())
+        {
+            if ("net.runelite.client.ui.ClientUI".equals(element.getClassName())
+                    && "openPanel".equals(element.getMethodName()))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private SidebarItem findItemByOriginalIndex(int originalIndex)
+    {
+        for (SidebarItem item : items)
+        {
+            if (item.getOriginalIndex() == originalIndex)
+            {
+                return item;
+            }
+        }
+        return null;
     }
 
     public void onPluginChanged()
@@ -547,6 +660,11 @@ public class SidebarManager
             sidebar.removeContainerListener(sidebarContainerListener);
             sidebarContainerListener = null;
         }
+        if (sidebarVisibilityListener != null)
+        {
+            sidebar.removeComponentListener(sidebarVisibilityListener);
+            sidebarVisibilityListener = null;
+        }
         if (sidebarChangeListener == null)
         {
             return;
@@ -559,6 +677,31 @@ public class SidebarManager
         sidebarChangeListener = null;
     }
 
+    /**
+     * Coalesces the size updates triggered by tab changes, lifecycle refreshes and
+     * visibility changes. RuneLite's ClientUI.Layout keeps its own record of the
+     * content width, so every extra layout pass with a stale record can turn a
+     * sidebar resize into a game-canvas resize.
+     */
+    private void scheduleCollapsedWidthUpdate()
+    {
+        if (!running || sidebar == null)
+        {
+            return;
+        }
+
+        JTabbedPane currentSidebar = sidebar;
+        long version = ++resizeVersion;
+        SwingUtilities.invokeLater(() ->
+        {
+            if (!running || sidebar != currentSidebar || version != resizeVersion)
+            {
+                return;
+            }
+            updateCollapsedWidth();
+        });
+    }
+
     private void updateCollapsedWidth()
     {
         if (sidebar == null || navigationPending)
@@ -566,64 +709,48 @@ public class SidebarManager
             return;
         }
 
-        if (!config.scrollableSidebar())
+        boolean needsNaturalWidth =
+                !config.scrollableSidebar()
+                        || sidebar.getSelectedIndex() != -1;
+
+        if (needsNaturalWidth)
         {
-            clearSidebarSizeConstraint();
-            refreshParentLayout();
+            // While hidden the size is ignored by RuneLite, so there is no need to
+            // force a layout. A panel selection still clears the override so the
+            // next open uses RuneLite's natural panel width immediately.
+            boolean changed = clearSidebarSizeConstraint();
+            if (changed && sidebar.isShowing())
+            {
+                revalidateSidebarLayout();
+            }
             return;
         }
 
-        if (sidebar.getSelectedIndex() != -1)
+        // Do not override the preferred size before RuneLite has laid the sidebar
+        // out. Doing so corrupts the initial frame bounds restore and makes the
+        // first panel open shrink the game canvas instead of growing the window.
+        if (!sidebar.isShowing() || sidebar.getHeight() <= 0)
         {
-            clearSidebarSizeConstraint();
-            refreshParentLayout();
             return;
         }
 
-        int tabWidth =
-                calculateTabStripWidth();
-
+        int tabWidth = calculateTabStripWidth();
         if (tabWidth <= 0)
         {
             return;
         }
 
-        Dimension current =
-                sidebar.getSize();
+        Dimension collapsedSize =
+                new Dimension(tabWidth, sidebar.getHeight());
 
-        int height = current.height;
-
-        if (height <= 0)
+        if (collapsedSize.equals(sidebar.getPreferredSize()))
         {
-            height =
-                    sidebar.getPreferredSize().height;
+            return;
         }
 
-        Dimension collapsedSize =
-                new Dimension(
-                        tabWidth,
-                        height
-                );
-
-        sidebar.setPreferredSize(
-                collapsedSize
-        );
-
-        sidebar.setMinimumSize(
-                new Dimension(
-                        tabWidth,
-                        0
-                )
-        );
-
-        sidebar.setMaximumSize(
-                new Dimension(
-                        tabWidth,
-                        Integer.MAX_VALUE
-                )
-        );
-
-        refreshParentLayout();
+        sidebar.setPreferredSize(collapsedSize);
+        collapsedWidthApplied = true;
+        revalidateSidebarLayout();
     }
 
     private int calculateTabStripWidth()
@@ -695,14 +822,24 @@ public class SidebarManager
         return estimatedWidth;
     }
 
-    private void clearSidebarSizeConstraint()
+    private boolean clearSidebarSizeConstraint()
     {
+        if (sidebar == null || !collapsedWidthApplied)
+        {
+            return false;
+        }
+
+        collapsedWidthApplied = false;
         sidebar.setPreferredSize(null);
-        sidebar.setMinimumSize(null);
-        sidebar.setMaximumSize(null);
+        return true;
     }
 
-    private void refreshParentLayout()
+    /**
+     * Invalidates only the sidebar and its content parent. RuneLite's own
+     * toggleSidebar() revalidates the same parent and owns resizing the frame;
+     * walking further up forces extra layout passes with stale width bookkeeping.
+     */
+    private void revalidateSidebarLayout()
     {
         if (sidebar == null)
         {
@@ -713,12 +850,10 @@ public class SidebarManager
         sidebar.repaint();
 
         Container parent = sidebar.getParent();
-
-        while (parent != null)
+        if (parent != null)
         {
             parent.revalidate();
             parent.repaint();
-            parent = parent.getParent();
         }
     }
 
@@ -835,12 +970,10 @@ public class SidebarManager
         removeTabAt(index);
         setHidden(item, true);
 
-        clearSidebarSizeConstraint();
-
         sidebar.revalidate();
         sidebar.repaint();
 
-        SwingUtilities.invokeLater(this::updateCollapsedWidth);
+        scheduleCollapsedWidthUpdate();
     }
 
     public void showItem(SidebarItem item)
@@ -869,12 +1002,10 @@ public class SidebarManager
 
         updateTab(insertIndex);
 
-        clearSidebarSizeConstraint();
-
         sidebar.revalidate();
         sidebar.repaint();
 
-        SwingUtilities.invokeLater(this::updateCollapsedWidth);
+        scheduleCollapsedWidthUpdate();
     }
 
     private int findInsertIndex(
@@ -1021,7 +1152,6 @@ public class SidebarManager
 
         setStoredValue(HIDDEN_ITEMS_KEY, null);
 
-        clearSidebarSizeConstraint();
         sidebar.revalidate();
         sidebar.repaint();
 
@@ -1030,7 +1160,7 @@ public class SidebarManager
             panel.refresh();
         }
 
-        SwingUtilities.invokeLater(this::updateCollapsedWidth);
+        scheduleCollapsedWidthUpdate();
     }
 
     public void applyHiddenSettings()
@@ -1074,7 +1204,6 @@ public class SidebarManager
                 }
             }
 
-            clearSidebarSizeConstraint();
             sidebar.revalidate();
             sidebar.repaint();
 
@@ -1083,7 +1212,7 @@ public class SidebarManager
                 panel.refresh();
             }
 
-            SwingUtilities.invokeLater(this::updateCollapsedWidth);
+            scheduleCollapsedWidthUpdate();
         });
     }
 
@@ -1158,11 +1287,10 @@ public class SidebarManager
             sidebar.setSelectedIndex(-1);
         }
 
-        clearSidebarSizeConstraint();
         sidebar.revalidate();
         sidebar.repaint();
 
-        SwingUtilities.invokeLater(this::updateCollapsedWidth);
+        scheduleCollapsedWidthUpdate();
     }
     private void saveItemOrder()
     {
